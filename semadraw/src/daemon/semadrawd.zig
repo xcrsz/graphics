@@ -1,0 +1,1221 @@
+const std = @import("std");
+const posix = std.posix;
+const protocol = @import("protocol");
+const socket_server = @import("socket_server");
+const tcp_server = @import("tcp_server");
+const client_session = @import("client_session");
+const surface_registry = @import("surface_registry");
+const shm = @import("shm");
+const sdcs_validator = @import("sdcs_validator");
+const compositor = @import("compositor");
+const backend = @import("backend");
+
+const log = std.log.scoped(.semadrawd);
+
+/// Poll file descriptor (Zig-native version of pollfd)
+const PollFd = extern struct {
+    fd: posix.fd_t,
+    events: i16,
+    revents: i16,
+};
+
+/// Daemon configuration
+pub const Config = struct {
+    socket_path: []const u8 = protocol.DEFAULT_SOCKET_PATH,
+    tcp_port: ?u16 = null, // TCP port for remote connections (null = disabled)
+    tcp_addr: [4]u8 = .{ 0, 0, 0, 0 }, // TCP bind address
+    max_clients: u32 = 256,
+    log_level: std.log.Level = .info,
+    backend_type: backend.BackendType = .software,
+    width: u32 = 1920, // Display width in pixels
+    height: u32 = 1080, // Display height in pixels
+};
+
+/// Remote client session wrapper
+const RemoteSession = struct {
+    client: tcp_server.RemoteClient,
+    id: protocol.ClientId,
+    state: client_session.SessionState,
+    sdcs_buffer: ?[]u8, // Inline SDCS data for current surface
+
+    pub fn getFd(self: *RemoteSession) posix.fd_t {
+        return self.client.getFd();
+    }
+};
+
+/// Daemon state
+pub const Daemon = struct {
+    allocator: std.mem.Allocator,
+    config: Config,
+    server: socket_server.SocketServer,
+    tcp: ?tcp_server.TcpServer,
+    clients: client_session.ClientManager,
+    remote_clients: std.AutoHashMap(protocol.ClientId, *RemoteSession),
+    next_remote_id: protocol.ClientId,
+    surfaces: surface_registry.SurfaceRegistry,
+    comp: compositor.Compositor,
+    running: bool,
+    // Pending clipboard request tracking
+    pending_clipboard_client: ?protocol.ClientId,
+    pending_clipboard_selection: u8,
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Daemon {
+        var server = try socket_server.SocketServer.bind(config.socket_path);
+        errdefer server.deinit();
+
+        // Initialize TCP server if port is configured
+        var tcp: ?tcp_server.TcpServer = null;
+        if (config.tcp_port) |port| {
+            tcp = try tcp_server.TcpServer.bindAddr(config.tcp_addr, port);
+        }
+        errdefer if (tcp) |*t| t.deinit();
+
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .server = server,
+            .tcp = tcp,
+            .clients = client_session.ClientManager.init(allocator),
+            .remote_clients = std.AutoHashMap(protocol.ClientId, *RemoteSession).init(allocator),
+            .next_remote_id = 0x80000000, // Remote clients start at high IDs
+            .surfaces = surface_registry.SurfaceRegistry.init(allocator),
+            .comp = undefined, // Initialized in initCompositor
+            .running = false,
+            .pending_clipboard_client = null,
+            .pending_clipboard_selection = 0,
+        };
+    }
+
+    /// Initialize compositor (must be called after init, before run)
+    pub fn initCompositor(self: *Daemon) !void {
+        self.comp = compositor.Compositor.init(self.allocator, &self.surfaces);
+
+        // Initialize output with configured resolution
+        try self.comp.initOutput(0, .{
+            .width = self.config.width,
+            .height = self.config.height,
+            .format = .rgba8,
+            .refresh_hz = 60,
+            .backend_type = self.config.backend_type,
+        });
+
+        // Start compositor for composition loop
+        self.comp.start();
+    }
+
+    pub fn deinit(self: *Daemon) void {
+        // Clean up remote clients
+        var iter = self.remote_clients.valueIterator();
+        while (iter.next()) |session_ptr| {
+            const session = session_ptr.*;
+            if (session.sdcs_buffer) |buf| self.allocator.free(buf);
+            session.client.close();
+            self.allocator.destroy(session);
+        }
+        self.remote_clients.deinit();
+
+        self.comp.deinit();
+        self.surfaces.deinit();
+        self.clients.deinit();
+        if (self.tcp) |*tcp| tcp.deinit();
+        self.server.deinit();
+    }
+
+    /// Main event loop using poll()
+    pub fn run(self: *Daemon) !void {
+        self.running = true;
+        log.info("semadrawd starting on {s}", .{self.config.socket_path});
+        if (self.tcp) |tcp| {
+            log.info("TCP server listening on port {}", .{tcp.port});
+        }
+
+        // Poll fd array: [0] = server, [1] = tcp (optional), [...] = clients
+        var poll_fds: std.ArrayListUnmanaged(PollFd) = .{};
+        defer poll_fds.deinit(self.allocator);
+
+        while (self.running) {
+            // Rebuild poll fd list
+            poll_fds.clearRetainingCapacity();
+
+            // Add Unix socket server
+            try poll_fds.append(self.allocator, .{
+                .fd = self.server.getFd(),
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            });
+
+            // Add TCP server if enabled
+            const tcp_fd: ?posix.fd_t = if (self.tcp) |tcp| tcp.getFd() else null;
+            if (tcp_fd) |fd| {
+                try poll_fds.append(self.allocator, .{
+                    .fd = fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                });
+            }
+
+            // Add local client sockets
+            var client_iter = self.clients.iterator();
+            while (client_iter.next()) |session| {
+                try poll_fds.append(self.allocator, .{
+                    .fd = session.*.getFd(),
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                });
+            }
+
+            // Add remote client sockets
+            var remote_iter = self.remote_clients.valueIterator();
+            while (remote_iter.next()) |session_ptr| {
+                try poll_fds.append(self.allocator, .{
+                    .fd = session_ptr.*.getFd(),
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                });
+            }
+
+            // Wait for events (100ms timeout for periodic tasks)
+            const poll_slice: []posix.pollfd = @ptrCast(poll_fds.items);
+            const n = posix.poll(poll_slice, 100) catch |err| {
+                log.err("poll error: {}", .{err});
+                continue;
+            };
+
+            // Poll backend events (keyboard, window close, etc.)
+            if (!self.comp.pollEvents()) {
+                log.info("backend requested shutdown", .{});
+                self.running = false;
+                break;
+            }
+
+            // Forward keyboard events to focused surface's client
+            const key_events = self.comp.getKeyEvents();
+            if (key_events.len > 0) {
+                self.forwardKeyEvents(key_events);
+            }
+
+            // Forward mouse events to focused surface's client
+            const mouse_events = self.comp.getMouseEvents();
+            if (mouse_events.len > 0) {
+                self.forwardMouseEvents(mouse_events);
+            }
+
+            // Check for pending clipboard responses
+            self.checkPendingClipboard();
+
+            // Process socket events if any
+            if (n > 0) {
+                for (poll_fds.items) |*pfd| {
+                    if (pfd.revents == 0) continue;
+
+                    if (pfd.fd == self.server.getFd()) {
+                        // New local client connection
+                        self.handleNewConnection() catch |err| {
+                            log.warn("failed to accept local connection: {}", .{err});
+                        };
+                    } else if (tcp_fd != null and pfd.fd == tcp_fd.?) {
+                        // New remote client connection
+                        self.handleNewRemoteConnection() catch |err| {
+                            log.warn("failed to accept remote connection: {}", .{err});
+                        };
+                    } else if (self.clients.findByFd(pfd.fd)) |session| {
+                        // Local client event
+                        if (pfd.revents & std.posix.POLL.IN != 0) {
+                            self.handleClientMessage(session) catch |err| {
+                                log.debug("client {} error: {}, disconnecting", .{ session.id, err });
+                                self.disconnectClient(session.id);
+                            };
+                        }
+                        if (pfd.revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                            log.debug("client {} disconnected", .{session.id});
+                            self.disconnectClient(session.id);
+                        }
+                    } else if (self.findRemoteByFd(pfd.fd)) |session| {
+                        // Remote client event
+                        if (pfd.revents & std.posix.POLL.IN != 0) {
+                            self.handleRemoteClientMessage(session) catch |err| {
+                                log.debug("remote client {} error: {}, disconnecting", .{ session.id, err });
+                                self.disconnectRemoteClient(session.id);
+                            };
+                        }
+                        if (pfd.revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                            log.debug("remote client {} disconnected", .{session.id});
+                            self.disconnectRemoteClient(session.id);
+                        }
+                    }
+                }
+            }
+
+            // Perform composition if needed (always check, regardless of socket events)
+            if (self.comp.needsComposite()) {
+                _ = self.comp.composite() catch |err| {
+                    log.warn("composite failed: {}", .{err});
+                };
+            }
+        }
+
+        log.info("semadrawd shutting down", .{});
+    }
+
+    fn findRemoteByFd(self: *Daemon, fd: posix.fd_t) ?*RemoteSession {
+        var iter = self.remote_clients.valueIterator();
+        while (iter.next()) |session_ptr| {
+            if (session_ptr.*.getFd() == fd) return session_ptr.*;
+        }
+        return null;
+    }
+
+    fn handleNewRemoteConnection(self: *Daemon) !void {
+        var tcp = self.tcp orelse return;
+        const remote_client = try tcp.accept();
+
+        const total_clients = self.clients.count() + self.remote_clients.count();
+        if (total_clients >= self.config.max_clients) {
+            log.warn("max clients reached, rejecting remote connection", .{});
+            var client = remote_client;
+            client.close();
+            return;
+        }
+
+        const session = try self.allocator.create(RemoteSession);
+        session.* = .{
+            .client = remote_client,
+            .id = self.next_remote_id,
+            .state = .awaiting_hello,
+            .sdcs_buffer = null,
+        };
+        self.next_remote_id += 1;
+
+        try self.remote_clients.put(session.id, session);
+
+        const addr_str = session.client.getAddrString();
+        log.info("remote client {} connected from {s}", .{ session.id, std.mem.sliceTo(&addr_str, 0) });
+    }
+
+    fn handleRemoteClientMessage(self: *Daemon, session: *RemoteSession) !void {
+        var msg = try session.client.readMessage(self.allocator) orelse return;
+        defer msg.deinit(self.allocator);
+
+        switch (session.state) {
+            .awaiting_hello => {
+                if (msg.header.msg_type != .hello) {
+                    try self.sendRemoteError(session, .protocol_error, 0);
+                    return error.ProtocolError;
+                }
+                try self.handleRemoteHello(session, msg.payload);
+            },
+            .connected => {
+                try self.handleRemoteRequest(session, msg.header.msg_type, msg.payload);
+            },
+            .disconnecting => {},
+        }
+    }
+
+    fn handleRemoteHello(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.HelloMsg.SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return error.InvalidPayload;
+        }
+
+        const hello = try protocol.HelloMsg.deserialize(payload.?);
+
+        if (hello.version_major != protocol.PROTOCOL_VERSION_MAJOR) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return error.VersionMismatch;
+        }
+
+        var reply_buf: [protocol.HelloReplyMsg.SIZE]u8 = undefined;
+        const reply = protocol.HelloReplyMsg{
+            .version_major = protocol.PROTOCOL_VERSION_MAJOR,
+            .version_minor = protocol.PROTOCOL_VERSION_MINOR,
+            .client_id = session.id,
+            .server_flags = 1, // Flag 1 = remote connection (inline buffers)
+        };
+        reply.serialize(&reply_buf);
+        try session.client.sendMessage(.hello_reply, &reply_buf);
+
+        session.state = .connected;
+        log.info("remote client {} completed handshake", .{session.id});
+    }
+
+    fn handleRemoteRequest(self: *Daemon, session: *RemoteSession, msg_type: protocol.MsgType, payload: ?[]u8) !void {
+        switch (msg_type) {
+            .create_surface => try self.handleRemoteCreateSurface(session, payload),
+            .destroy_surface => try self.handleRemoteDestroySurface(session, payload),
+            .attach_buffer_inline => try self.handleRemoteAttachBufferInline(session, payload),
+            .commit => try self.handleRemoteCommit(session, payload),
+            .set_visible => try self.handleRemoteSetVisible(session, payload),
+            .set_z_order => try self.handleRemoteSetZOrder(session, payload),
+            .set_position => try self.handleRemoteSetPosition(session, payload),
+            .sync => try self.handleRemoteSync(session, payload),
+            .disconnect => {
+                session.state = .disconnecting;
+            },
+            else => {
+                log.warn("remote client {} sent unexpected message type: {}", .{ session.id, msg_type });
+                try self.sendRemoteError(session, .invalid_message, 0);
+            },
+        }
+    }
+
+    fn handleRemoteCreateSurface(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.CreateSurfaceMsg.SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.CreateSurfaceMsg.deserialize(payload.?);
+
+        const surface = self.surfaces.createSurface(session.id, msg.logical_width, msg.logical_height) catch {
+            try self.sendRemoteError(session, .resource_limit, 0);
+            return;
+        };
+
+        self.comp.onSurfaceCreated(surface.id) catch {};
+
+        var reply_buf: [protocol.SurfaceCreatedMsg.SIZE]u8 = undefined;
+        const reply = protocol.SurfaceCreatedMsg{ .surface_id = surface.id };
+        reply.serialize(&reply_buf);
+        try session.client.sendMessage(.surface_created, &reply_buf);
+
+        log.debug("remote client {} created surface {}", .{ session.id, surface.id });
+    }
+
+    fn handleRemoteDestroySurface(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.DestroySurfaceMsg.SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.DestroySurfaceMsg.deserialize(payload.?);
+
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try self.sendRemoteError(session, .permission_denied, msg.surface_id);
+            return;
+        }
+
+        self.comp.onSurfaceDestroyed(msg.surface_id);
+        self.surfaces.destroySurface(msg.surface_id);
+        log.debug("remote client {} destroyed surface {}", .{ session.id, msg.surface_id });
+    }
+
+    fn handleRemoteAttachBufferInline(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.AttachBufferInlineMsg.HEADER_SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.AttachBufferInlineMsg.deserialize(payload.?);
+        const expected_len = protocol.AttachBufferInlineMsg.HEADER_SIZE + msg.sdcs_length;
+
+        if (payload.?.len < expected_len) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try self.sendRemoteError(session, .permission_denied, msg.surface_id);
+            return;
+        }
+
+        // Store SDCS data for this session
+        if (session.sdcs_buffer) |buf| self.allocator.free(buf);
+        session.sdcs_buffer = try self.allocator.alloc(u8, msg.sdcs_length);
+        @memcpy(session.sdcs_buffer.?, payload.?[protocol.AttachBufferInlineMsg.HEADER_SIZE..expected_len]);
+
+        // Validate SDCS
+        const validation = sdcs_validator.SdcsValidator.validateBuffer(session.sdcs_buffer.?);
+        if (!validation.valid) {
+            try self.sendRemoteError(session, .validation_failed, msg.surface_id);
+            self.allocator.free(session.sdcs_buffer.?);
+            session.sdcs_buffer = null;
+            return;
+        }
+
+        // Attach to surface
+        self.surfaces.attachInlineBuffer(msg.surface_id, session.sdcs_buffer.?) catch {
+            try self.sendRemoteError(session, .invalid_surface, msg.surface_id);
+            return;
+        };
+
+        log.debug("remote client {} attached {} bytes to surface {}", .{ session.id, msg.sdcs_length, msg.surface_id });
+    }
+
+    fn handleRemoteCommit(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.CommitMsg.SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.CommitMsg.deserialize(payload.?);
+
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try self.sendRemoteError(session, .permission_denied, msg.surface_id);
+            return;
+        }
+
+        const frame_number = self.surfaces.commit(msg.surface_id) catch {
+            try self.sendRemoteError(session, .invalid_surface, msg.surface_id);
+            return;
+        };
+
+        self.comp.onSurfaceCommit(msg.surface_id) catch {};
+
+        var reply_buf: [protocol.FrameCompleteMsg.SIZE]u8 = undefined;
+        const reply = protocol.FrameCompleteMsg{
+            .surface_id = msg.surface_id,
+            .frame_number = frame_number,
+            .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+        };
+        reply.serialize(&reply_buf);
+        try session.client.sendMessage(.frame_complete, &reply_buf);
+
+        log.debug("remote client {} committed surface {} frame {}", .{ session.id, msg.surface_id, frame_number });
+    }
+
+    fn handleRemoteSetVisible(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.SetVisibleMsg.SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.SetVisibleMsg.deserialize(payload.?);
+
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try self.sendRemoteError(session, .permission_denied, msg.surface_id);
+            return;
+        }
+
+        self.surfaces.setVisible(msg.surface_id, msg.visible != 0) catch {
+            try self.sendRemoteError(session, .invalid_surface, msg.surface_id);
+            return;
+        };
+
+        // When a surface becomes visible, trigger full repaint to ensure it gets rendered
+        if (msg.visible != 0) {
+            self.comp.damageAll();
+        }
+    }
+
+    fn handleRemoteSetZOrder(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.SetZOrderMsg.SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.SetZOrderMsg.deserialize(payload.?);
+
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try self.sendRemoteError(session, .permission_denied, msg.surface_id);
+            return;
+        }
+
+        self.surfaces.setZOrder(msg.surface_id, msg.z_order) catch {
+            try self.sendRemoteError(session, .invalid_surface, msg.surface_id);
+            return;
+        };
+    }
+
+    fn handleRemoteSetPosition(self: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.SetPositionMsg.SIZE) {
+            try self.sendRemoteError(session, .protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.SetPositionMsg.deserialize(payload.?);
+
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try self.sendRemoteError(session, .permission_denied, msg.surface_id);
+            return;
+        }
+
+        self.surfaces.setPosition(msg.surface_id, msg.x, msg.y) catch {
+            try self.sendRemoteError(session, .invalid_surface, msg.surface_id);
+            return;
+        };
+    }
+
+    fn handleRemoteSync(_: *Daemon, session: *RemoteSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.SyncMsg.SIZE) {
+            return error.InvalidPayload;
+        }
+
+        const msg = try protocol.SyncMsg.deserialize(payload.?);
+
+        var reply_buf: [protocol.SyncDoneMsg.SIZE]u8 = undefined;
+        const reply = protocol.SyncDoneMsg{ .sync_id = msg.sync_id };
+        reply.serialize(&reply_buf);
+        try session.client.sendMessage(.sync_done, &reply_buf);
+    }
+
+    fn sendRemoteError(self: *Daemon, session: *RemoteSession, code: protocol.ErrorCode, context: u32) !void {
+        _ = self;
+        var reply_buf: [protocol.ErrorReplyMsg.SIZE]u8 = undefined;
+        const reply = protocol.ErrorReplyMsg{ .code = code, .context = context };
+        reply.serialize(&reply_buf);
+        try session.client.sendMessage(.error_reply, &reply_buf);
+    }
+
+    fn disconnectRemoteClient(self: *Daemon, client_id: protocol.ClientId) void {
+        if (self.remote_clients.fetchRemove(client_id)) |entry| {
+            const session = entry.value;
+            self.surfaces.removeClientSurfaces(client_id);
+            if (session.sdcs_buffer) |buf| self.allocator.free(buf);
+            session.client.close();
+            self.allocator.destroy(session);
+        }
+    }
+
+    fn handleNewConnection(self: *Daemon) !void {
+        const client_fd = try self.server.accept();
+
+        if (self.clients.count() >= self.config.max_clients) {
+            log.warn("max clients reached, rejecting connection", .{});
+            posix.close(client_fd);
+            return;
+        }
+
+        const session = try self.clients.createSession(client_fd);
+        log.info("client {} connected", .{session.id});
+    }
+
+    fn handleClientMessage(self: *Daemon, session: *client_session.ClientSession) !void {
+        var msg = try session.socket.readMessage(self.allocator) orelse return;
+        defer msg.deinit(self.allocator);
+
+        switch (session.state) {
+            .awaiting_hello => {
+                if (msg.header.msg_type != .hello) {
+                    try session.sendError(.protocol_error, 0);
+                    return error.ProtocolError;
+                }
+                try self.handleHello(session, msg.payload);
+            },
+            .connected => {
+                try self.handleRequest(session, msg.header.msg_type, msg.payload);
+            },
+            .disconnecting => {},
+        }
+    }
+
+    fn handleHello(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        _ = self;
+
+        if (payload == null or payload.?.len < protocol.HelloMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return error.InvalidPayload;
+        }
+
+        const hello = try protocol.HelloMsg.deserialize(payload.?);
+
+        // Version check
+        if (hello.version_major != protocol.PROTOCOL_VERSION_MAJOR) {
+            try session.sendError(.protocol_error, 0);
+            return error.VersionMismatch;
+        }
+
+        // Send reply
+        var reply_buf: [protocol.HelloReplyMsg.SIZE]u8 = undefined;
+        const reply = protocol.HelloReplyMsg{
+            .version_major = protocol.PROTOCOL_VERSION_MAJOR,
+            .version_minor = protocol.PROTOCOL_VERSION_MINOR,
+            .client_id = session.id,
+            .server_flags = 0,
+        };
+        reply.serialize(&reply_buf);
+        try session.send(.hello_reply, &reply_buf);
+
+        session.state = .connected;
+        log.info("client {} completed handshake", .{session.id});
+    }
+
+    fn handleRequest(self: *Daemon, session: *client_session.ClientSession, msg_type: protocol.MsgType, payload: ?[]u8) !void {
+        switch (msg_type) {
+            .create_surface => try self.handleCreateSurface(session, payload),
+            .destroy_surface => try self.handleDestroySurface(session, payload),
+            .attach_buffer_inline => try self.handleAttachBufferInline(session, payload),
+            .commit => try self.handleCommit(session, payload),
+            .set_visible => try self.handleSetVisible(session, payload),
+            .set_z_order => try self.handleSetZOrder(session, payload),
+            .set_position => try self.handleSetPosition(session, payload),
+            .sync => try self.handleSync(session, payload),
+            .clipboard_set => try self.handleClipboardSet(session, payload),
+            .clipboard_request => try self.handleClipboardRequest(session, payload),
+            .disconnect => {
+                session.state = .disconnecting;
+            },
+            else => {
+                log.warn("client {} sent unexpected message type: {}", .{ session.id, msg_type });
+                try session.sendError(.invalid_message, 0);
+            },
+        }
+    }
+
+    fn handleCreateSurface(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.CreateSurfaceMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.CreateSurfaceMsg.deserialize(payload.?);
+
+        // Check resource limits
+        if (!session.usage.canCreateSurface(session.limits, msg.logical_width, msg.logical_height)) {
+            try session.sendError(.resource_limit, 0);
+            return;
+        }
+
+        // Create surface in registry
+        const surface = self.surfaces.createSurface(session.id, msg.logical_width, msg.logical_height) catch {
+            try session.sendError(.resource_limit, 0);
+            return;
+        };
+        try session.addSurface(surface.id, msg.logical_width, msg.logical_height);
+
+        // Notify compositor
+        self.comp.onSurfaceCreated(surface.id) catch {};
+
+        // Send reply
+        var reply_buf: [protocol.SurfaceCreatedMsg.SIZE]u8 = undefined;
+        const reply = protocol.SurfaceCreatedMsg{ .surface_id = surface.id };
+        reply.serialize(&reply_buf);
+        try session.send(.surface_created, &reply_buf);
+
+        log.debug("client {} created surface {}", .{ session.id, surface.id });
+    }
+
+    fn handleDestroySurface(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.DestroySurfaceMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.DestroySurfaceMsg.deserialize(payload.?);
+
+        // Verify ownership via registry
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try session.sendError(.permission_denied, msg.surface_id);
+            return;
+        }
+
+        // Get dimensions for usage tracking before destroying
+        if (self.surfaces.getSurface(msg.surface_id)) |surface| {
+            session.removeSurface(msg.surface_id, surface.logical_width, surface.logical_height);
+        }
+
+        // Notify compositor
+        self.comp.onSurfaceDestroyed(msg.surface_id);
+
+        self.surfaces.destroySurface(msg.surface_id);
+        log.debug("client {} destroyed surface {}", .{ session.id, msg.surface_id });
+    }
+
+    fn handleAttachBufferInline(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.AttachBufferInlineMsg.HEADER_SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.AttachBufferInlineMsg.deserialize(payload.?);
+        const expected_len = protocol.AttachBufferInlineMsg.HEADER_SIZE + msg.sdcs_length;
+
+        if (payload.?.len < expected_len) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try session.sendError(.permission_denied, msg.surface_id);
+            return;
+        }
+
+        // Store SDCS data for this session
+        if (session.sdcs_buffer) |buf| session.allocator.free(buf);
+        session.sdcs_buffer = try session.allocator.alloc(u8, msg.sdcs_length);
+        @memcpy(session.sdcs_buffer.?, payload.?[protocol.AttachBufferInlineMsg.HEADER_SIZE..expected_len]);
+
+        // Validate SDCS
+        const validation = sdcs_validator.SdcsValidator.validateBuffer(session.sdcs_buffer.?);
+        if (!validation.valid) {
+            try session.sendError(.validation_failed, msg.surface_id);
+            session.allocator.free(session.sdcs_buffer.?);
+            session.sdcs_buffer = null;
+            return;
+        }
+
+        // Attach to surface
+        self.surfaces.attachInlineBuffer(msg.surface_id, session.sdcs_buffer.?) catch {
+            try session.sendError(.invalid_surface, msg.surface_id);
+            return;
+        };
+    }
+
+    fn handleCommit(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.CommitMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.CommitMsg.deserialize(payload.?);
+
+        // Verify ownership via registry
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try session.sendError(.permission_denied, msg.surface_id);
+            return;
+        }
+
+        // Mark surface as committed in registry
+        const frame_number = self.surfaces.commit(msg.surface_id) catch {
+            try session.sendError(.invalid_surface, msg.surface_id);
+            return;
+        };
+
+        // Notify compositor of surface damage
+        self.comp.onSurfaceCommit(msg.surface_id) catch {};
+
+        // Send frame_complete
+        var reply_buf: [protocol.FrameCompleteMsg.SIZE]u8 = undefined;
+        const reply = protocol.FrameCompleteMsg{
+            .surface_id = msg.surface_id,
+            .frame_number = frame_number,
+            .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+        };
+        reply.serialize(&reply_buf);
+        try session.send(.frame_complete, &reply_buf);
+
+        log.debug("client {} committed surface {} frame {}", .{ session.id, msg.surface_id, frame_number });
+    }
+
+    fn handleSetVisible(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.SetVisibleMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.SetVisibleMsg.deserialize(payload.?);
+
+        // Verify ownership via registry
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try session.sendError(.permission_denied, msg.surface_id);
+            return;
+        }
+
+        self.surfaces.setVisible(msg.surface_id, msg.visible != 0) catch {
+            try session.sendError(.invalid_surface, msg.surface_id);
+            return;
+        };
+
+        // When a surface becomes visible, trigger full repaint to ensure it gets rendered
+        if (msg.visible != 0) {
+            self.comp.damageAll();
+        }
+
+        log.debug("client {} set surface {} visible={}", .{ session.id, msg.surface_id, msg.visible != 0 });
+    }
+
+    fn handleSetZOrder(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.SetZOrderMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.SetZOrderMsg.deserialize(payload.?);
+
+        // Verify ownership via registry
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try session.sendError(.permission_denied, msg.surface_id);
+            return;
+        }
+
+        self.surfaces.setZOrder(msg.surface_id, msg.z_order) catch {
+            try session.sendError(.invalid_surface, msg.surface_id);
+            return;
+        };
+        log.debug("client {} set surface {} z_order={}", .{ session.id, msg.surface_id, msg.z_order });
+    }
+
+    fn handleSetPosition(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.SetPositionMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.SetPositionMsg.deserialize(payload.?);
+
+        // Verify ownership via registry
+        if (!self.surfaces.isOwner(msg.surface_id, session.id)) {
+            try session.sendError(.permission_denied, msg.surface_id);
+            return;
+        }
+
+        self.surfaces.setPosition(msg.surface_id, msg.x, msg.y) catch {
+            try session.sendError(.invalid_surface, msg.surface_id);
+            return;
+        };
+        log.debug("client {} set surface {} position=({}, {})", .{ session.id, msg.surface_id, msg.x, msg.y });
+    }
+
+    fn handleSync(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        _ = self;
+
+        if (payload == null or payload.?.len < protocol.SyncMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.SyncMsg.deserialize(payload.?);
+
+        // Send sync done immediately (no pending operations to wait for yet)
+        var reply_buf: [protocol.SyncDoneMsg.SIZE]u8 = undefined;
+        const reply = protocol.SyncDoneMsg{ .sync_id = msg.sync_id };
+        reply.serialize(&reply_buf);
+        try session.send(.sync_done, &reply_buf);
+    }
+
+    fn handleClipboardSet(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.ClipboardSetMsg.HEADER_SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.ClipboardSetMsg.deserialize(payload.?);
+        const text_start = protocol.ClipboardSetMsg.HEADER_SIZE;
+        const text_end = text_start + msg.length;
+
+        if (payload.?.len < text_end) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const text = payload.?[text_start..text_end];
+        const selection: u8 = @intFromEnum(msg.selection);
+
+        self.comp.setClipboard(selection, text) catch |err| {
+            log.warn("clipboard set failed: {}", .{err});
+            return;
+        };
+
+        log.debug("client {} set clipboard selection={} len={}", .{ session.id, selection, text.len });
+    }
+
+    fn handleClipboardRequest(self: *Daemon, session: *client_session.ClientSession, payload: ?[]u8) !void {
+        if (payload == null or payload.?.len < protocol.ClipboardRequestMsg.SIZE) {
+            try session.sendError(.protocol_error, 0);
+            return;
+        }
+
+        const msg = try protocol.ClipboardRequestMsg.deserialize(payload.?);
+        const selection: u8 = @intFromEnum(msg.selection);
+
+        // Check if we already have clipboard data cached
+        if (self.comp.getClipboardData(selection)) |data| {
+            // Send clipboard data immediately
+            try self.sendClipboardData(session, msg.selection, data);
+        } else {
+            // Request clipboard from backend - it's async
+            // Store the pending request and client to respond to later
+            self.pending_clipboard_client = session.id;
+            self.pending_clipboard_selection = selection;
+            self.comp.requestClipboard(selection);
+        }
+    }
+
+    fn sendClipboardData(self: *Daemon, session: *client_session.ClientSession, selection: protocol.ClipboardSelection, data: []const u8) !void {
+        _ = self;
+        // Build response: header + text
+        const header_size = protocol.ClipboardDataMsg.HEADER_SIZE;
+        const total_size = header_size + data.len;
+
+        var buf = try session.allocator.alloc(u8, total_size);
+        defer session.allocator.free(buf);
+
+        const header = protocol.ClipboardDataMsg{
+            .selection = selection,
+            .length = @intCast(data.len),
+        };
+        header.serialize(buf[0..header_size]);
+        @memcpy(buf[header_size..], data);
+
+        try session.send(.clipboard_data, buf);
+        log.debug("sent clipboard data to client {}: selection={} len={}", .{ session.id, @intFromEnum(selection), data.len });
+    }
+
+    fn checkPendingClipboard(self: *Daemon) void {
+        // If we have a pending clipboard request, check if data is available
+        if (self.pending_clipboard_client) |client_id| {
+            // Check if request is still pending in backend
+            if (self.comp.isClipboardPending()) {
+                return; // Still waiting
+            }
+
+            // Data should now be available
+            if (self.comp.getClipboardData(self.pending_clipboard_selection)) |data| {
+                // Find the client and send the data
+                if (self.clients.sessions.get(client_id)) |session| {
+                    const selection: protocol.ClipboardSelection = @enumFromInt(self.pending_clipboard_selection);
+                    self.sendClipboardData(session, selection, data) catch |err| {
+                        log.warn("failed to send clipboard data to client {}: {}", .{ client_id, err });
+                    };
+                }
+            }
+
+            // Clear pending request
+            self.pending_clipboard_client = null;
+        }
+    }
+
+    fn disconnectClient(self: *Daemon, client_id: protocol.ClientId) void {
+        // Clean up surfaces owned by this client
+        self.surfaces.removeClientSurfaces(client_id);
+        self.clients.destroySession(client_id);
+        // Trigger full repaint to clear any remnants of destroyed surfaces
+        self.comp.damageAll();
+    }
+
+    pub fn stop(self: *Daemon) void {
+        self.running = false;
+    }
+
+    /// Forward keyboard events to the top visible surface's client
+    fn forwardKeyEvents(self: *Daemon, key_events: []const backend.KeyEvent) void {
+        // Get the top visible surface to send keyboard input to
+        const top_surface_id = self.surfaces.getTopVisibleSurface() orelse {
+            log.debug("forwardKeyEvents: no top visible surface", .{});
+            return;
+        };
+        const surface = self.surfaces.getSurface(top_surface_id) orelse {
+            log.debug("forwardKeyEvents: surface {} not found", .{top_surface_id});
+            return;
+        };
+        log.debug("forwardKeyEvents: {} events to surface {} (owner {})", .{ key_events.len, top_surface_id, surface.owner });
+
+        for (key_events) |event| {
+            const msg = protocol.KeyPressMsg{
+                .surface_id = top_surface_id,
+                .key_code = event.key_code,
+                .modifiers = event.modifiers,
+                .pressed = if (event.pressed) 1 else 0,
+            };
+            var payload: [protocol.KeyPressMsg.SIZE]u8 = undefined;
+            msg.serialize(&payload);
+
+            // Try to send to local client first
+            if (self.clients.findById(surface.owner)) |session| {
+                session.send(.key_press, &payload) catch |err| {
+                    log.warn("failed to send key event to client {}: {}", .{ surface.owner, err });
+                };
+                log.debug("sent key event to local client {}", .{surface.owner});
+            } else if (self.remote_clients.get(surface.owner)) |remote_session| {
+                // Try remote client
+                remote_session.client.sendMessage(.key_press, &payload) catch |err| {
+                    log.warn("failed to send key event to remote client {}: {}", .{ surface.owner, err });
+                };
+                log.debug("sent key event to remote client {}", .{surface.owner});
+            } else {
+                log.warn("no client found for surface owner {}", .{surface.owner});
+            }
+        }
+    }
+
+    /// Forward mouse events to the top visible surface's client
+    fn forwardMouseEvents(self: *Daemon, mouse_events: []const backend.MouseEvent) void {
+        // Get the top visible surface to send mouse input to
+        const top_surface_id = self.surfaces.getTopVisibleSurface() orelse return;
+        const surface = self.surfaces.getSurface(top_surface_id) orelse return;
+
+        for (mouse_events) |event| {
+            const msg = protocol.MouseEventMsg{
+                .surface_id = top_surface_id,
+                .x = event.x,
+                .y = event.y,
+                .button = @enumFromInt(@intFromEnum(event.button)),
+                .event_type = @enumFromInt(@intFromEnum(event.event_type)),
+                .modifiers = event.modifiers,
+            };
+            var payload: [protocol.MouseEventMsg.SIZE]u8 = undefined;
+            msg.serialize(&payload);
+
+            // Try to send to local client first
+            if (self.clients.findById(surface.owner)) |session| {
+                session.send(.mouse_event, &payload) catch {};
+            } else if (self.remote_clients.get(surface.owner)) |remote_session| {
+                // Try remote client
+                remote_session.client.sendMessage(.mouse_event, &payload) catch {};
+            }
+        }
+    }
+};
+
+pub fn main() !void {
+    // Ignore SIGPIPE to prevent daemon from dying when clients disconnect
+    // This is standard practice for server applications
+    const act = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &act, null);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var config = Config{};
+
+    // Parse arguments
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--socket") or std.mem.startsWith(u8, arg, "--socket=")) {
+            const socket_path = if (std.mem.startsWith(u8, arg, "--socket="))
+                arg["--socket=".len..]
+            else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    log.err("missing argument for {s}", .{arg});
+                    return error.InvalidArgument;
+                }
+                break :blk args[i];
+            };
+            config.socket_path = socket_path;
+        } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--backend") or std.mem.startsWith(u8, arg, "--backend=")) {
+            const backend_name = if (std.mem.startsWith(u8, arg, "--backend="))
+                arg["--backend=".len..]
+            else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    log.err("missing argument for {s}", .{arg});
+                    return error.InvalidArgument;
+                }
+                break :blk args[i];
+            };
+            if (std.mem.eql(u8, backend_name, "software")) {
+                config.backend_type = .software;
+            } else if (std.mem.eql(u8, backend_name, "headless")) {
+                config.backend_type = .headless;
+            } else if (std.mem.eql(u8, backend_name, "kms")) {
+                config.backend_type = .kms;
+            } else if (std.mem.eql(u8, backend_name, "x11")) {
+                config.backend_type = .x11;
+            } else if (std.mem.eql(u8, backend_name, "vulkan")) {
+                config.backend_type = .vulkan;
+            } else if (std.mem.eql(u8, backend_name, "vulkan_console") or std.mem.eql(u8, backend_name, "vulkan-console")) {
+                config.backend_type = .vulkan_console;
+            } else if (std.mem.eql(u8, backend_name, "wayland")) {
+                config.backend_type = .wayland;
+            } else if (std.mem.eql(u8, backend_name, "drawfs")) {
+                config.backend_type = .drawfs;
+            } else {
+                log.err("unknown backend: {s} (valid: software, headless, kms, x11, vulkan, vulkan_console, wayland, drawfs)", .{backend_name});
+                return error.InvalidArgument;
+            }
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tcp") or std.mem.startsWith(u8, arg, "--tcp=")) {
+            const tcp_str = if (std.mem.startsWith(u8, arg, "--tcp="))
+                arg["--tcp=".len..]
+            else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    log.err("missing argument for {s}", .{arg});
+                    return error.InvalidArgument;
+                }
+                break :blk args[i];
+            };
+            config.tcp_port = std.fmt.parseInt(u16, tcp_str, 10) catch {
+                log.err("invalid TCP port: {s}", .{tcp_str});
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "--tcp-addr") or std.mem.startsWith(u8, arg, "--tcp-addr=")) {
+            const addr_str = if (std.mem.startsWith(u8, arg, "--tcp-addr="))
+                arg["--tcp-addr=".len..]
+            else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    log.err("missing argument for {s}", .{arg});
+                    return error.InvalidArgument;
+                }
+                break :blk args[i];
+            };
+            // Parse IP address (simple dotted quad parsing)
+            var parts: [4]u8 = undefined;
+            var part_idx: usize = 0;
+            var iter = std.mem.splitScalar(u8, addr_str, '.');
+            while (iter.next()) |part| {
+                if (part_idx >= 4) {
+                    log.err("invalid IP address: {s}", .{addr_str});
+                    return error.InvalidArgument;
+                }
+                parts[part_idx] = std.fmt.parseInt(u8, part, 10) catch {
+                    log.err("invalid IP address: {s}", .{addr_str});
+                    return error.InvalidArgument;
+                };
+                part_idx += 1;
+            }
+            if (part_idx != 4) {
+                log.err("invalid IP address: {s}", .{addr_str});
+                return error.InvalidArgument;
+            }
+            config.tcp_addr = parts;
+        } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--resolution") or std.mem.startsWith(u8, arg, "--resolution=")) {
+            const res_str = if (std.mem.startsWith(u8, arg, "--resolution="))
+                arg["--resolution=".len..]
+            else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    log.err("missing argument for {s}", .{arg});
+                    return error.InvalidArgument;
+                }
+                break :blk args[i];
+            };
+            // Parse resolution in WIDTHxHEIGHT format
+            var res_iter = std.mem.splitScalar(u8, res_str, 'x');
+            const width_str = res_iter.next() orelse {
+                log.err("invalid resolution format: {s} (expected WIDTHxHEIGHT)", .{res_str});
+                return error.InvalidArgument;
+            };
+            const height_str = res_iter.next() orelse {
+                log.err("invalid resolution format: {s} (expected WIDTHxHEIGHT)", .{res_str});
+                return error.InvalidArgument;
+            };
+            config.width = std.fmt.parseInt(u32, width_str, 10) catch {
+                log.err("invalid width in resolution: {s}", .{res_str});
+                return error.InvalidArgument;
+            };
+            config.height = std.fmt.parseInt(u32, height_str, 10) catch {
+                log.err("invalid height in resolution: {s}", .{res_str});
+                return error.InvalidArgument;
+            };
+            if (config.width < 320 or config.height < 200) {
+                log.err("resolution too small (minimum 320x200)", .{});
+                return error.InvalidArgument;
+            }
+            if (config.width > 7680 or config.height > 4320) {
+                log.err("resolution too large (maximum 7680x4320)", .{});
+                return error.InvalidArgument;
+            }
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            log.info("semadrawd - SemaDraw compositor daemon", .{});
+            log.info("Usage: semadrawd [OPTIONS]", .{});
+            log.info("Options:", .{});
+            log.info("  -s, --socket PATH     Socket path (default: {s})", .{protocol.DEFAULT_SOCKET_PATH});
+            log.info("  -b, --backend TYPE    Backend type: software, headless, kms, x11, vulkan, vulkan_console, wayland, drawfs (default: software)", .{});
+            log.info("  -r, --resolution WxH  Display resolution (default: 1920x1080)", .{});
+            log.info("  -t, --tcp PORT        Enable TCP remote connections on PORT (default: disabled)", .{});
+            log.info("  --tcp-addr ADDR       TCP bind address (default: 0.0.0.0)", .{});
+            log.info("  -h, --help            Show this help", .{});
+            return;
+        } else {
+            log.err("unknown argument: {s}", .{arg});
+            return error.InvalidArgument;
+        }
+    }
+
+    var daemon = try Daemon.init(allocator, config);
+    defer daemon.deinit();
+
+    try daemon.initCompositor();
+
+    try daemon.run();
+}
