@@ -570,8 +570,10 @@ pub const DrawfsBackend = struct {
 
             // Execute command
             switch (opcode) {
-                0x0001 => {}, // RESET
-                0x0010 => { // FILL_RECT
+                0x0001 => {}, // RESET - no-op for stateless renderer
+                0x0004 => {}, // SET_BLEND - stored state, not yet used
+                0x0007 => {}, // SET_ANTIALIAS - stored state, not yet used
+                0x0010 => { // FILL_RECT (32 bytes: x, y, w, h, r, g, b, a)
                     if (payload.len >= 32) {
                         const x = readF32(payload[0..4]);
                         const y = readF32(payload[4..8]);
@@ -585,8 +587,38 @@ pub const DrawfsBackend = struct {
                         self.fillRect(fb, x, y, w, h, r, g, b_val, a);
                     }
                 },
+                0x0011 => { // STROKE_RECT (36 bytes: x, y, w, h, r, g, b, a, stroke_width)
+                    if (payload.len >= 36) {
+                        const x = readF32(payload[0..4]);
+                        const y = readF32(payload[4..8]);
+                        const w = readF32(payload[8..12]);
+                        const h = readF32(payload[12..16]);
+                        const r = readF32(payload[16..20]);
+                        const g = readF32(payload[20..24]);
+                        const b_val = readF32(payload[24..28]);
+                        const a = readF32(payload[28..32]);
+                        const stroke_width = readF32(payload[32..36]);
+
+                        self.strokeRect(fb, x, y, w, h, r, g, b_val, a, stroke_width);
+                    }
+                },
+                0x0012 => { // STROKE_LINE (36 bytes: x1, y1, x2, y2, r, g, b, a, stroke_width)
+                    if (payload.len >= 36) {
+                        const x1 = readF32(payload[0..4]);
+                        const y1 = readF32(payload[4..8]);
+                        const x2 = readF32(payload[8..12]);
+                        const y2 = readF32(payload[12..16]);
+                        const r = readF32(payload[16..20]);
+                        const g = readF32(payload[20..24]);
+                        const b_val = readF32(payload[24..28]);
+                        const a = readF32(payload[28..32]);
+                        const stroke_width = readF32(payload[32..36]);
+
+                        self.strokeLine(fb, x1, y1, x2, y2, r, g, b_val, a, stroke_width);
+                    }
+                },
                 0x00F0 => return, // END
-                else => {}, // Ignore unknown
+                else => {}, // Ignore unknown opcodes
             }
 
             // Align to 8 bytes
@@ -638,6 +670,104 @@ pub const DrawfsBackend = struct {
                         fb[idx + 3] = 0xFF;
                     }
                 }
+            }
+        }
+    }
+
+    fn strokeRect(self: *Self, fb: []u8, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b_col: f32, a: f32, stroke_width: f32) void {
+        // Draw rectangle outline using four filled rectangles for the edges
+        const sw = @max(1.0, stroke_width);
+        const half_sw = sw / 2.0;
+
+        // Top edge
+        self.fillRect(fb, x - half_sw, y - half_sw, w + sw, sw, r, g, b_col, a);
+        // Bottom edge
+        self.fillRect(fb, x - half_sw, y + h - half_sw, w + sw, sw, r, g, b_col, a);
+        // Left edge (between top and bottom)
+        self.fillRect(fb, x - half_sw, y + half_sw, sw, h - sw, r, g, b_col, a);
+        // Right edge (between top and bottom)
+        self.fillRect(fb, x + w - half_sw, y + half_sw, sw, h - sw, r, g, b_col, a);
+    }
+
+    fn strokeLine(self: *Self, fb: []u8, x1: f32, y1: f32, x2: f32, y2: f32, r: f32, g: f32, b_col: f32, a: f32, stroke_width: f32) void {
+        // Bresenham-style line drawing with stroke width
+        const fb_w = self.width;
+        const fb_h = self.height;
+        const stride = self.surface_stride;
+
+        const cr = clampU8(r);
+        const cg = clampU8(g);
+        const cb = clampU8(b_col);
+        const ca = clampU8(a);
+
+        const sw = @max(1.0, stroke_width);
+        const half_sw = @as(i32, @intFromFloat(sw / 2.0));
+
+        // Calculate line parameters
+        const dx_f = x2 - x1;
+        const dy_f = y2 - y1;
+        const length = @sqrt(dx_f * dx_f + dy_f * dy_f);
+
+        if (length < 0.5) {
+            // Point - just draw a filled circle/square at the location
+            self.fillRect(fb, x1 - sw / 2.0, y1 - sw / 2.0, sw, sw, r, g, b_col, a);
+            return;
+        }
+
+        // Use integer Bresenham algorithm
+        var ix1: i32 = @intFromFloat(x1);
+        var iy1: i32 = @intFromFloat(y1);
+        const ix2: i32 = @intFromFloat(x2);
+        const iy2: i32 = @intFromFloat(y2);
+
+        const dx: i32 = @intCast(@abs(ix2 - ix1));
+        const dy: i32 = @intCast(@abs(iy2 - iy1));
+        const sx: i32 = if (ix1 < ix2) @as(i32, 1) else @as(i32, -1);
+        const sy: i32 = if (iy1 < iy2) @as(i32, 1) else @as(i32, -1);
+        var err: i32 = dx - dy;
+
+        while (true) {
+            // Draw a square at current position for stroke width
+            var py: i32 = -half_sw;
+            while (py <= half_sw) : (py += 1) {
+                var px: i32 = -half_sw;
+                while (px <= half_sw) : (px += 1) {
+                    const plot_x = ix1 + px;
+                    const plot_y = iy1 + py;
+
+                    if (plot_x >= 0 and plot_x < @as(i32, @intCast(fb_w)) and
+                        plot_y >= 0 and plot_y < @as(i32, @intCast(fb_h)))
+                    {
+                        const idx = @as(usize, @intCast(plot_y)) * stride + @as(usize, @intCast(plot_x)) * 4;
+                        if (idx + 3 < fb.len) {
+                            if (ca == 255) {
+                                fb[idx + 0] = cb;
+                                fb[idx + 1] = cg;
+                                fb[idx + 2] = cr;
+                                fb[idx + 3] = 0xFF;
+                            } else if (ca > 0) {
+                                const sa: f32 = @as(f32, @floatFromInt(ca)) / 255.0;
+                                const inv_sa = 1.0 - sa;
+                                fb[idx + 0] = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(cb)) * sa + @as(f32, @floatFromInt(fb[idx + 0])) * inv_sa));
+                                fb[idx + 1] = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(cg)) * sa + @as(f32, @floatFromInt(fb[idx + 1])) * inv_sa));
+                                fb[idx + 2] = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(cr)) * sa + @as(f32, @floatFromInt(fb[idx + 2])) * inv_sa));
+                                fb[idx + 3] = 0xFF;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (ix1 == ix2 and iy1 == iy2) break;
+
+            const e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                ix1 += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                iy1 += sy;
             }
         }
     }
