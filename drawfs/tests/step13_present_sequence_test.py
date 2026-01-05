@@ -47,8 +47,8 @@ def main():
             ev = p.poll(1000)
             if not ev:
                 raise SystemExit("FAIL: poll did not show readable for event")
-            esid, estatus, ecookie = s.read_presented_event()
-            if esid != sid or estatus != 0 or ecookie != cookie:
+            esid, ereserved, ecookie = s.read_presented_event()
+            if esid != sid or ereserved != 0 or ecookie != cookie:
                 raise SystemExit("FAIL: SURFACE_PRESENTED event mismatch")
 
         print("OK: Step 13 present sequencing passed")

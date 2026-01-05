@@ -51,7 +51,7 @@ def session_create_present_once(s, cookie: int):
         raise SystemExit("FAIL: surface present reply mismatch")
 
     # Read event
-    sid4, _flags4, cookie4 = s.read_presented_event()
+    sid4, _reserved4, cookie4 = s.read_presented_event()
     if sid4 != sid or cookie4 != cookie:
         raise SystemExit("FAIL: surface presented event mismatch")
 

@@ -50,14 +50,23 @@ MSG_TYPES = {
     0x9002: "EVT_SURFACE_PRESENTED",
 }
 
-# Error codes
+# Error codes (from drawfs_proto.h enum drawfs_err_code)
 ERROR_CODES = {
     0: "OK",
     1: "INVALID_FRAME",
     2: "INVALID_MSG",
-    3: "UNSUPPORTED_CAP",
-    4: "INVALID_ARG",
-    5: "OVERFLOW",
+    3: "UNSUPPORTED_VERSION",
+    4: "UNSUPPORTED_CAP",
+    5: "PERMISSION",
+    6: "NOT_FOUND",
+    7: "BUSY",
+    8: "NO_MEMORY",
+    9: "INVALID_HANDLE",
+    10: "INVALID_STATE",
+    11: "INVALID_ARG",
+    12: "OVERFLOW",
+    13: "IO",
+    14: "INTERNAL",
 }
 
 # Pixel formats

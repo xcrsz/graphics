@@ -74,8 +74,8 @@ def wait_presented(fd, timeout_ms: int = 1000):
     msg_type, _mid, payload = read_one(fd)
     if msg_type != EVT_SURFACE_PRESENTED:
         raise RuntimeError(f"expected SURFACE_PRESENTED (0x9002), got 0x{msg_type:x}")
-    surface_id, flags, cookie = struct.unpack_from("<IIQ", payload, 0)
-    return surface_id, flags, cookie
+    surface_id, reserved, cookie = struct.unpack_from("<IIQ", payload, 0)
+    return surface_id, reserved, cookie
 
 
 def main():
@@ -118,10 +118,10 @@ def main():
             surface_present_raw(fd1, frame_id=4, msg_id=4, surface_id=sid1, cookie=cookie1a)
             surface_present_raw(fd2, frame_id=13, msg_id=13, surface_id=sid2, cookie=cookie2a)
 
-            psid1, _flags1, pcookie1 = wait_presented(fd1, timeout_ms=1000)
+            psid1, _reserved1, pcookie1 = wait_presented(fd1, timeout_ms=1000)
             assert psid1 == sid1 and pcookie1 == cookie1a
 
-            psid2, _flags2, pcookie2 = wait_presented(fd2, timeout_ms=1000)
+            psid2, _reserved2, pcookie2 = wait_presented(fd2, timeout_ms=1000)
             assert psid2 == sid2 and pcookie2 == cookie2a
 
             # Second round, reverse order
@@ -130,10 +130,10 @@ def main():
             surface_present_raw(fd2, frame_id=14, msg_id=14, surface_id=sid2, cookie=cookie2b)
             surface_present_raw(fd1, frame_id=5, msg_id=5, surface_id=sid1, cookie=cookie1b)
 
-            psid2, _flags2, pcookie2 = wait_presented(fd2, timeout_ms=1000)
+            psid2, _reserved2, pcookie2 = wait_presented(fd2, timeout_ms=1000)
             assert psid2 == sid2 and pcookie2 == cookie2b
 
-            psid1, _flags1, pcookie1 = wait_presented(fd1, timeout_ms=1000)
+            psid1, _reserved1, pcookie1 = wait_presented(fd1, timeout_ms=1000)
             assert psid1 == sid1 and pcookie1 == cookie1b
 
         finally:
@@ -156,7 +156,7 @@ def main():
             cookie2c = 0xcccccccccccccccc
             surface_present_raw(fd2, frame_id=15, msg_id=15, surface_id=sid2, cookie=cookie2c)
 
-            psid2, _flags2, pcookie2 = wait_presented(fd2, timeout_ms=1000)
+            psid2, _reserved2, pcookie2 = wait_presented(fd2, timeout_ms=1000)
             assert psid2 == sid2 and pcookie2 == cookie2c
         finally:
             mm2.close()
