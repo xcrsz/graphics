@@ -73,7 +73,7 @@ struct drawfs_rpl_hello {
     uint16_t server_major;
     uint16_t server_minor;
     uint32_t server_flags;
-    uint32_t caps_bytes;
+    uint32_t max_reply_bytes; /* max bytes server will send in a single reply */
 } __attribute__((packed));
 
 struct drawfs_rpl_display_list {

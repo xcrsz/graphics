@@ -109,11 +109,11 @@ def decode_payload(msg_type: int, payload: bytes) -> List[str]:
 
         elif msg_type == 0x8001:  # RPL_HELLO
             if len(payload) >= 16:
-                status, major, minor, flags, caps_bytes = struct.unpack_from("<iHHII", payload, 0)
+                status, major, minor, flags, max_reply_bytes = struct.unpack_from("<iHHII", payload, 0)
                 lines.append(f"status: {status} ({os.strerror(status) if status else 'OK'})")
                 lines.append(f"server_version: {major}.{minor}")
                 lines.append(f"flags: 0x{flags:08x}")
-                lines.append(f"caps_bytes: {caps_bytes}")
+                lines.append(f"max_reply_bytes: {max_reply_bytes}")
 
         elif msg_type == 0x0011:  # REQ_DISPLAY_OPEN
             if len(payload) >= 4:
