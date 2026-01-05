@@ -148,24 +148,24 @@ fn readFrame(fd: posix.fd_t, buf: []u8) !usize {
         return error.PollError;
     }
 
-    log.debug("readFrame: data available, reading header", .{});
-    // Read frame header first
-    var total: usize = 0;
-    while (total < DRAWFS_FRAME_HDR_SIZE) {
-        log.debug("readFrame: reading header bytes {}/{}", .{ total, DRAWFS_FRAME_HDR_SIZE });
-        const n = posix.read(fd, buf[total..DRAWFS_FRAME_HDR_SIZE]) catch |err| {
-            log.err("readFrame: read failed: {}", .{err});
-            return err;
-        };
-        if (n == 0) {
-            log.err("readFrame: EOF at offset {}", .{total});
-            return error.EndOfFile;
-        }
-        log.debug("readFrame: read {} bytes", .{n});
-        total += n;
+    // Read entire frame in one syscall (kernel expects atomic read)
+    log.debug("readFrame: reading frame (up to {} bytes)", .{buf.len});
+    const n = posix.read(fd, buf) catch |err| {
+        log.err("readFrame: read failed: {}", .{err});
+        return err;
+    };
+    if (n == 0) {
+        log.err("readFrame: EOF", .{});
+        return error.EndOfFile;
+    }
+    log.debug("readFrame: read {} bytes", .{n});
+
+    // Validate we got at least the header
+    if (n < DRAWFS_FRAME_HDR_SIZE) {
+        log.err("readFrame: short read, got {} bytes, need at least {}", .{ n, DRAWFS_FRAME_HDR_SIZE });
+        return error.ShortRead;
     }
 
-    log.debug("readFrame: header received, {} bytes", .{total});
     // Validate magic
     const magic = std.mem.readInt(u32, buf[0..4], .little);
     if (magic != DRAWFS_MAGIC) {
@@ -174,29 +174,16 @@ fn readFrame(fd: posix.fd_t, buf: []u8) !usize {
     }
     log.debug("readFrame: magic OK", .{});
 
-    // Get frame size and read rest
+    // Validate frame size
     const frame_bytes = std.mem.readInt(u32, buf[8..12], .little);
-    log.debug("readFrame: frame_bytes={}, need {} more bytes", .{ frame_bytes, frame_bytes - total });
-    if (frame_bytes > buf.len) {
-        return error.BufferTooSmall;
+    log.debug("readFrame: frame_bytes={}", .{frame_bytes});
+    if (n < frame_bytes) {
+        log.err("readFrame: incomplete frame, got {} bytes, expected {}", .{ n, frame_bytes });
+        return error.IncompleteFrame;
     }
 
-    while (total < frame_bytes) {
-        log.debug("readFrame: reading payload bytes {}/{}", .{ total, frame_bytes });
-        const n = posix.read(fd, buf[total..frame_bytes]) catch |err| {
-            log.err("readFrame: payload read failed: {}", .{err});
-            return err;
-        };
-        if (n == 0) {
-            log.err("readFrame: EOF during payload at offset {}", .{total});
-            return error.EndOfFile;
-        }
-        log.debug("readFrame: read {} more bytes", .{n});
-        total += n;
-    }
-
-    log.debug("readFrame: complete, {} bytes total", .{total});
-    return total;
+    log.debug("readFrame: complete, {} bytes", .{n});
+    return n;
 }
 
 fn parseReply(buf: []const u8) struct { msg_type: u16, msg_id: u32, payload: []const u8 } {
