@@ -169,23 +169,33 @@ fn readFrame(fd: posix.fd_t, buf: []u8) !usize {
     // Validate magic
     const magic = std.mem.readInt(u32, buf[0..4], .little);
     if (magic != DRAWFS_MAGIC) {
+        log.err("readFrame: invalid magic 0x{x:08}", .{magic});
         return error.InvalidMagic;
     }
+    log.debug("readFrame: magic OK", .{});
 
     // Get frame size and read rest
     const frame_bytes = std.mem.readInt(u32, buf[8..12], .little);
+    log.debug("readFrame: frame_bytes={}, need {} more bytes", .{ frame_bytes, frame_bytes - total });
     if (frame_bytes > buf.len) {
         return error.BufferTooSmall;
     }
 
     while (total < frame_bytes) {
+        log.debug("readFrame: reading payload bytes {}/{}", .{ total, frame_bytes });
         const n = posix.read(fd, buf[total..frame_bytes]) catch |err| {
+            log.err("readFrame: payload read failed: {}", .{err});
             return err;
         };
-        if (n == 0) return error.EndOfFile;
+        if (n == 0) {
+            log.err("readFrame: EOF during payload at offset {}", .{total});
+            return error.EndOfFile;
+        }
+        log.debug("readFrame: read {} more bytes", .{n});
         total += n;
     }
 
+    log.debug("readFrame: complete, {} bytes total", .{total});
     return total;
 }
 
