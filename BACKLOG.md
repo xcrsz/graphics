@@ -98,10 +98,11 @@ This assumes FreeBSD encoding with 16-byte struct size. Will fail on Linux or if
 
 ## Priority 2: Moderate (May Cause Issues)
 
-### 2.1 Document Version Compatibility Matrix
-**Files**: New file `docs/VERSION_COMPAT.md` or add to existing docs
+### 2.1 Document Version Compatibility Matrix ✅ DONE
+**Files**: `drawfs/docs/PROTOCOL.md`
 **Effort**: Small
 **Risk**: Low
+**Commit**: `de2d009`
 
 **Problem**: Version mismatch between components:
 | Component | Version |
@@ -111,43 +112,47 @@ This assumes FreeBSD encoding with 16-byte struct size. Will fail on Linux or if
 | SDCS | v0.1 |
 
 **Tasks**:
-- [ ] Document current version matrix
-- [ ] Define version negotiation behavior during HELLO
-- [ ] Decide: bump semadraw to v1.0, or document v0.1 as compatible with drawfs v1.0
-- [ ] Add protocol version constants to shared location
+- [x] Document current version matrix
+- [x] Define version negotiation behavior during HELLO
+- [x] Document v0.1 as compatible with drawfs v1.0
+- [ ] Add protocol version constants to shared location (future improvement)
 
 ---
 
-### 2.2 Fix Field Naming Inconsistency
-**Files**: `drawfs/sys/dev/drawfs/drawfs_proto.h` OR `drawfs/docs/PROTOCOL.md`
+### 2.2 Fix Field Naming Inconsistency ✅ DONE
+**Files**: `drawfs/sys/dev/drawfs/drawfs_proto.h`, `drawfs.c`, `drawfs_dump.py`
 **Effort**: Small
 **Risk**: Low
+**Commit**: `de2d009`
 
 **Problem**: HELLO reply field naming differs:
 - Header: `caps_bytes` (line 76)
 - Spec: `max_reply_bytes`
 
 **Tasks**:
-- [ ] Decide canonical name (prefer `max_reply_bytes` to match request field)
-- [ ] Update header or spec to use consistent name
-- [ ] Add documentation comment explaining the field's purpose
+- [x] Decide canonical name (prefer `max_reply_bytes` to match request field)
+- [x] Update header to use consistent name
+- [x] Update drawfs.c to use new field name
+- [x] Update drawfs_dump.py test to use new field name
+- [x] Add documentation comment explaining the field's purpose
 
 ---
 
-### 2.3 Document Alignment Requirements
-**Files**: `docs/ALIGNMENT.md` or add to protocol docs
+### 2.3 Document Alignment Requirements ✅ DONE
+**Files**: `drawfs/docs/PROTOCOL.md`
 **Effort**: Small
 **Risk**: Low
+**Commit**: `de2d009`
 
 **Problem**: Different alignment requirements:
 - drawfs: 4-byte alignment
 - SDCS: 8-byte alignment
 
 **Tasks**:
-- [ ] Document alignment requirements for each protocol
-- [ ] Document padding requirements at protocol boundaries
-- [ ] Review existing code for alignment issues
-- [ ] Add alignment helpers if needed
+- [x] Document alignment requirements for each protocol
+- [x] Document padding requirements at protocol boundaries
+- [ ] Review existing code for alignment issues (future improvement)
+- [ ] Add alignment helpers if needed (future improvement)
 
 ---
 
@@ -221,16 +226,16 @@ This assumes FreeBSD encoding with 16-byte struct size. Will fail on Linux or if
 
 ## Acceptance Criteria
 
-### For Critical Issues (P1)
-- [ ] All P1 items implemented and tested
-- [ ] No compilation errors in either codebase
-- [ ] Existing tests pass
-- [ ] drawfs backend can render all documented SDCS commands
+### For Critical Issues (P1) ✅ COMPLETE
+- [x] All P1 items implemented and tested
+- [x] No compilation errors in either codebase
+- [x] Existing tests pass
+- [x] drawfs backend can render all documented SDCS commands
 
-### For Moderate Issues (P2)
-- [ ] Documentation updated and consistent
-- [ ] Version negotiation documented
-- [ ] No ambiguity in field names
+### For Moderate Issues (P2) ✅ COMPLETE
+- [x] Documentation updated and consistent
+- [x] Version negotiation documented
+- [x] No ambiguity in field names
 
 ### For Improvements (P3)
 - [ ] Tests added for protocol validation
