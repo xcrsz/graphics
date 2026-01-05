@@ -418,14 +418,13 @@ fn run(allocator: std.mem.Allocator, config: Config) !void {
 
         // Check PTY output
         if (poll_fds[0].revents & posix.POLL.IN != 0) {
-            log.debug("PTY has data, reading...", .{});
             if (shell.read() catch |err| blk: {
-                log.debug("PTY read error: {}", .{err});
+                log.err("PTY read error: {}", .{err});
                 break :blk null;
             }) |data| {
-                log.debug("PTY read {} bytes: {s}", .{ data.len, data[0..@min(data.len, 64)] });
+                // Diagnostic: show what we're receiving from the shell
+                log.info("PTY: {} bytes", .{data.len});
                 parser.feedSlice(data);
-                log.debug("VT100 parser fed, screen dirty={}", .{scr.dirty});
             }
         }
         if (poll_fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
