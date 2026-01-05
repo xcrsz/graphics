@@ -25,10 +25,11 @@ This backlog tracks the work required to resolve protocol incompatibilities betw
 
 ---
 
-### 1.2 Fix API_OVERVIEW.md Documentation
+### 1.2 Fix API_OVERVIEW.md Documentation ✅ DONE
 **Files**: `semadraw/docs/API_OVERVIEW.md`
 **Effort**: Small
 **Risk**: Low
+**Commit**: `d54119e`
 
 **Problem**: Documentation lists incorrect message type values:
 | Message | Documented | Correct (from protocol.zig) |
@@ -37,11 +38,13 @@ This backlog tracks the work required to resolve protocol incompatibilities betw
 | ERROR | `0x00FF` | `0x80F0` |
 
 **Tasks**:
-- [ ] Update line 40: Change `HELLO_REPLY | 0x0002` to `HELLO_REPLY | 0x8001`
-- [ ] Update line 51: Change `ERROR | 0x00FF` to `ERROR | 0x80F0`
-- [ ] Add note about 0x8000 reply convention
-- [ ] Review other message types for correctness
-- [ ] Consider auto-generating docs from protocol.zig
+- [x] Update line 40: Change `HELLO_REPLY | 0x0002` to `HELLO_REPLY | 0x8001`
+- [x] Update line 51: Change `ERROR | 0x00FF` to `ERROR | 0x80F0`
+- [x] Add note about 0x8000 reply convention
+- [x] Review other message types for correctness
+- [x] Fix header format (was 16 bytes with magic, actually 8 bytes without)
+- [x] Add missing message types (ATTACH_BUFFER, SYNC, KEY_PRESS, MOUSE_EVENT, etc.)
+- [ ] Consider auto-generating docs from protocol.zig (future improvement)
 
 ---
 
