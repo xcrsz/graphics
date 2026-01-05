@@ -158,29 +158,34 @@ This assumes FreeBSD encoding with 16-byte struct size. Will fail on Linux or if
 
 ## Priority 3: Improvements (Nice to Have)
 
-### 3.1 Add Magic to semadraw IPC Header
+### 3.1 Add Magic to semadraw IPC Header ✅ RESOLVED
 **Files**: `semadraw/src/ipc/protocol.zig`, `semadraw/docs/API_OVERVIEW.md`
 **Effort**: Small
 **Risk**: Low (but breaks existing clients)
+**Status**: Resolved in P1.2 (documentation fix)
 
-**Problem**: API_OVERVIEW.md mentions magic `0x53454D41` ("SEMA") but protocol.zig header has no magic field.
+**Problem**: API_OVERVIEW.md mentioned magic `0x53454D41` ("SEMA") but protocol.zig header has no magic field.
+
+**Resolution**: The documentation was incorrect. The IPC protocol has never used a magic field.
+This was fixed in P1.2 when API_OVERVIEW.md was corrected to show the actual 8-byte header format.
 
 **Tasks**:
-- [ ] Verify if magic is actually used in IPC
-- [ ] Either remove from docs or add to protocol
-- [ ] Consider for v1.0 protocol update
+- [x] Verify if magic is actually used in IPC → **No, never used**
+- [x] Either remove from docs or add to protocol → **Docs corrected in P1.2**
+- [x] Consider for v1.0 protocol update → **Not needed, protocol is correct as-is**
 
 ---
 
-### 3.2 Consolidate Protocol Constants
-**Files**: Multiple
+### 3.2 Consolidate Protocol Constants ✅ DONE
+**Files**: `shared/protocol_constants.json`, `shared/README.md`
 **Effort**: Medium
 **Risk**: Low
 
 **Tasks**:
-- [ ] Create shared constants file for message types
-- [ ] Create shared constants file for error codes
-- [ ] Auto-generate language bindings from single source of truth
+- [x] Create shared constants file for message types
+- [x] Create shared constants file for error codes
+- [x] Document all three protocols (drawfs, semadraw IPC, SDCS)
+- [ ] Auto-generate language bindings from single source of truth (future improvement)
 
 ---
 
