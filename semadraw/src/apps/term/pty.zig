@@ -21,6 +21,7 @@ extern "c" fn posix_openpt(flags: c_int) c_int;
 extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 /// Pseudo-terminal handler for shell communication
 pub const Pty = struct {
@@ -108,7 +109,7 @@ pub const Pty = struct {
             };
 
             // Set TERM environment variable for proper terminal behavior
-            _ = std.c.setenv("TERM", "xterm-256color", 1);
+            _ = setenv("TERM", "xterm-256color", 1);
 
             const envp = std.c.environ;
 
