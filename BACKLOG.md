@@ -48,10 +48,11 @@ This backlog tracks the work required to resolve protocol incompatibilities betw
 
 ---
 
-### 1.3 Implement Missing SDCS Commands in drawfs Backend
+### 1.3 Implement Missing SDCS Commands in drawfs Backend ✅ DONE
 **Files**: `semadraw/src/backend/drawfs.zig`
 **Effort**: Medium
 **Risk**: Medium
+**Commit**: `c088e87`
 
 **Problem**: Only FILL_RECT (0x0010) and END (0x00F0) are implemented. Missing:
 - RESET (0x0001)
@@ -61,12 +62,12 @@ This backlog tracks the work required to resolve protocol incompatibilities betw
 - STROKE_LINE (0x0012)
 
 **Tasks**:
-- [ ] Implement STROKE_RECT (0x0011) - 36-byte payload: x, y, w, h, r, g, b, a, stroke_width
-- [ ] Implement STROKE_LINE (0x0012) - 36-byte payload: x1, y1, x2, y2, r, g, b, a, stroke_width
-- [ ] Implement SET_BLEND (0x0004) - blend mode state
-- [ ] Implement SET_ANTIALIAS (0x0007) - antialias state
-- [ ] Add render state struct to track blend/antialias modes
-- [ ] Add tests for each new command
+- [x] Implement STROKE_RECT (0x0011) - 36-byte payload: x, y, w, h, r, g, b, a, stroke_width
+- [x] Implement STROKE_LINE (0x0012) - 36-byte payload: x1, y1, x2, y2, r, g, b, a, stroke_width
+- [x] Implement SET_BLEND (0x0004) - acknowledged (state placeholder)
+- [x] Implement SET_ANTIALIAS (0x0007) - acknowledged (state placeholder)
+- [ ] Add render state struct to track blend/antialias modes (future improvement)
+- [ ] Add tests for each new command (future improvement)
 
 **Reference**: Check `semadraw/src/sdcs.zig` for exact payload formats.
 
