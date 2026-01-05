@@ -73,10 +73,11 @@ This backlog tracks the work required to resolve protocol incompatibilities betw
 
 ---
 
-### 1.4 Fix Hardcoded ioctl Encoding
+### 1.4 Fix Hardcoded ioctl Encoding ✅ DONE
 **Files**: `semadraw/src/backend/drawfs.zig`
 **Effort**: Medium
 **Risk**: High (platform-specific)
+**Commit**: `13fdf56`
 
 **Problem**: Line 46 hardcodes the ioctl number:
 ```zig
@@ -85,10 +86,10 @@ const DRAWFSGIOC_MAP_SURFACE: u32 = 0xC0104402;
 This assumes FreeBSD encoding with 16-byte struct size. Will fail on Linux or if struct changes.
 
 **Tasks**:
-- [ ] Create ioctl encoding function that computes at comptime
-- [ ] Define platform-specific constants (`_IOC_*` values differ)
-- [ ] Add validation that struct size matches expected
-- [ ] Add comment documenting the encoding formula
+- [x] Create ioctl encoding function that computes at comptime
+- [x] Define platform-specific constants (`_IOC_*` values differ)
+- [x] Add validation that struct size matches expected
+- [x] Add comment documenting the encoding formula
 - [ ] Consider build-time generation from kernel headers (longer term)
 
 **Formula**: `_IOWR('D', 0x02, struct)` = `0xC0000000 | (sizeof(struct) << 16) | ('D' << 8) | 0x02`
