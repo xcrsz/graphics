@@ -107,6 +107,9 @@ pub const Pty = struct {
                 null,
             };
 
+            // Set TERM environment variable for proper terminal behavior
+            _ = std.c.setenv("TERM", "xterm-256color", 1);
+
             const envp = std.c.environ;
 
             const err = std.c.execve(
