@@ -422,9 +422,15 @@ fn run(allocator: std.mem.Allocator, config: Config) !void {
                 log.err("PTY read error: {}", .{err});
                 break :blk null;
             }) |data| {
-                // Diagnostic: show what we're receiving from the shell
-                log.info("PTY: {} bytes", .{data.len});
+                // Diagnostic: show first 40 chars as printable
+                var preview: [40]u8 = undefined;
+                const preview_len = @min(data.len, 40);
+                for (data[0..preview_len], 0..) |c, i| {
+                    preview[i] = if (c >= 32 and c < 127) c else '.';
+                }
+                log.info("PTY: {} bytes: {s}", .{ data.len, preview[0..preview_len] });
                 parser.feedSlice(data);
+                log.info("screen dirty={}", .{scr.dirty});
             }
         }
         if (poll_fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
