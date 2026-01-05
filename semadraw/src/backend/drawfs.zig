@@ -129,8 +129,7 @@ fn makeFrame(allocator: std.mem.Allocator, frame_id: u32, msg_type: u16, msg_id:
 }
 
 fn readFrame(fd: posix.fd_t, buf: []u8) !usize {
-    // Poll for data first (required on FreeBSD for some drivers)
-    log.debug("readFrame: polling fd={} for data (timeout=5000ms)", .{fd});
+    // Poll for data first (kernel requires poll before read)
     var poll_fds = [_]posix.pollfd{
         .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
     };
@@ -138,7 +137,6 @@ fn readFrame(fd: posix.fd_t, buf: []u8) !usize {
         log.err("poll failed: {}", .{err});
         return err;
     };
-    log.debug("poll returned: result={}, revents=0x{x}", .{ poll_result, poll_fds[0].revents });
     if (poll_result == 0) {
         log.err("poll timeout waiting for frame", .{});
         return error.Timeout;
@@ -149,40 +147,32 @@ fn readFrame(fd: posix.fd_t, buf: []u8) !usize {
     }
 
     // Read entire frame in one syscall (kernel expects atomic read)
-    log.debug("readFrame: reading frame (up to {} bytes)", .{buf.len});
     const n = posix.read(fd, buf) catch |err| {
-        log.err("readFrame: read failed: {}", .{err});
+        log.err("read failed: {}", .{err});
         return err;
     };
     if (n == 0) {
-        log.err("readFrame: EOF", .{});
         return error.EndOfFile;
     }
-    log.debug("readFrame: read {} bytes", .{n});
 
-    // Validate we got at least the header
+    // Validate header
     if (n < DRAWFS_FRAME_HDR_SIZE) {
-        log.err("readFrame: short read, got {} bytes, need at least {}", .{ n, DRAWFS_FRAME_HDR_SIZE });
+        log.err("short read: {} bytes", .{n});
         return error.ShortRead;
     }
 
-    // Validate magic
     const magic = std.mem.readInt(u32, buf[0..4], .little);
     if (magic != DRAWFS_MAGIC) {
-        log.err("readFrame: invalid magic 0x{x:08}", .{magic});
+        log.err("invalid magic: 0x{x:08}", .{magic});
         return error.InvalidMagic;
     }
-    log.debug("readFrame: magic OK", .{});
 
-    // Validate frame size
     const frame_bytes = std.mem.readInt(u32, buf[8..12], .little);
-    log.debug("readFrame: frame_bytes={}", .{frame_bytes});
     if (n < frame_bytes) {
-        log.err("readFrame: incomplete frame, got {} bytes, expected {}", .{ n, frame_bytes });
+        log.err("incomplete frame: got {}, expected {}", .{ n, frame_bytes });
         return error.IncompleteFrame;
     }
 
-    log.debug("readFrame: complete, {} bytes", .{n});
     return n;
 }
 
@@ -305,31 +295,18 @@ pub const DrawfsBackend = struct {
         const frame = try makeFrame(self.allocator, frame_id, msg_type, msg_id, payload);
         defer self.allocator.free(frame);
 
-        // Send
-        log.debug("sending frame: {} bytes, msg_type=0x{x:04}", .{ frame.len, msg_type });
-        // Hex dump first 48 bytes
-        var hex_buf: [128]u8 = undefined;
-        var hex_len: usize = 0;
-        for (frame[0..@min(frame.len, 48)]) |b| {
-            const written = std.fmt.bufPrint(hex_buf[hex_len..], "{x:0>2}", .{b}) catch break;
-            hex_len += written.len;
-        }
-        log.debug("frame hex: {s}", .{hex_buf[0..hex_len]});
-
+        // Send frame
         var sent: usize = 0;
         while (sent < frame.len) {
             sent += posix.write(self.fd, frame[sent..]) catch |err| {
                 return err;
             };
         }
-        log.debug("sent {} bytes, waiting for reply...", .{sent});
 
         // Read reply (may need to skip events)
         while (true) {
             const n = try readFrame(self.fd, &self.read_buf);
-            log.debug("received frame: {} bytes", .{n});
             const reply = parseReply(self.read_buf[0..n]);
-            log.debug("parsed reply: msg_type=0x{x:04}, payload_len={}", .{ reply.msg_type, reply.payload.len });
 
             // Skip events
             if (reply.msg_type == EVT_SURFACE_PRESENTED) {
