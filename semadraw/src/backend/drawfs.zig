@@ -283,6 +283,15 @@ pub const DrawfsBackend = struct {
 
         // Send
         log.debug("sending frame: {} bytes, msg_type=0x{x:04}", .{ frame.len, msg_type });
+        // Hex dump first 48 bytes
+        var hex_buf: [128]u8 = undefined;
+        var hex_len: usize = 0;
+        for (frame[0..@min(frame.len, 48)]) |b| {
+            const written = std.fmt.bufPrint(hex_buf[hex_len..], "{x:0>2}", .{b}) catch break;
+            hex_len += written.len;
+        }
+        log.debug("frame hex: {s}", .{hex_buf[0..hex_len]});
+
         var sent: usize = 0;
         while (sent < frame.len) {
             sent += posix.write(self.fd, frame[sent..]) catch |err| {
