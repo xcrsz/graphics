@@ -129,16 +129,43 @@ fn makeFrame(allocator: std.mem.Allocator, frame_id: u32, msg_type: u16, msg_id:
 }
 
 fn readFrame(fd: posix.fd_t, buf: []u8) !usize {
+    // Poll for data first (required on FreeBSD for some drivers)
+    log.debug("readFrame: polling fd={} for data (timeout=5000ms)", .{fd});
+    var poll_fds = [_]posix.pollfd{
+        .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+    const poll_result = posix.poll(&poll_fds, 5000) catch |err| {
+        log.err("poll failed: {}", .{err});
+        return err;
+    };
+    log.debug("poll returned: result={}, revents=0x{x}", .{ poll_result, poll_fds[0].revents });
+    if (poll_result == 0) {
+        log.err("poll timeout waiting for frame", .{});
+        return error.Timeout;
+    }
+    if ((poll_fds[0].revents & posix.POLL.IN) == 0) {
+        log.err("poll returned but no POLLIN: revents=0x{x}", .{poll_fds[0].revents});
+        return error.PollError;
+    }
+
+    log.debug("readFrame: data available, reading header", .{});
     // Read frame header first
     var total: usize = 0;
     while (total < DRAWFS_FRAME_HDR_SIZE) {
+        log.debug("readFrame: reading header bytes {}/{}", .{ total, DRAWFS_FRAME_HDR_SIZE });
         const n = posix.read(fd, buf[total..DRAWFS_FRAME_HDR_SIZE]) catch |err| {
+            log.err("readFrame: read failed: {}", .{err});
             return err;
         };
-        if (n == 0) return error.EndOfFile;
+        if (n == 0) {
+            log.err("readFrame: EOF at offset {}", .{total});
+            return error.EndOfFile;
+        }
+        log.debug("readFrame: read {} bytes", .{n});
         total += n;
     }
 
+    log.debug("readFrame: header received, {} bytes", .{total});
     // Validate magic
     const magic = std.mem.readInt(u32, buf[0..4], .little);
     if (magic != DRAWFS_MAGIC) {
