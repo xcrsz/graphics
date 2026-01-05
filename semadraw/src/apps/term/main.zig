@@ -10,7 +10,7 @@ const font = @import("font");
 const log = std.log.scoped(.semadraw_term);
 
 pub const std_options = std.Options{
-    .log_level = .debug,
+    .log_level = .info,
 };
 
 /// Mouse button state for Plan 9-style chording
@@ -538,7 +538,7 @@ fn renderAndCommitWithBlink(allocator: std.mem.Allocator, rend: *renderer.Render
 
     // Build menu overlay if chord menu is visible (with scaled dimensions)
     const menu_overlay: ?renderer.Renderer.MenuOverlay = if (chord_menu.visible) blk: {
-        log.info("rendering with {s} menu at ({}, {})", .{ @tagName(chord_menu.menu_type), chord_menu.x, chord_menu.y });
+        log.debug("rendering with {s} menu at ({}, {})", .{ @tagName(chord_menu.menu_type), chord_menu.x, chord_menu.y });
         // Scale menu dimensions based on font scale
         const item_h = rend.getCellHeight() + 4 * rend.scale;
         const item_w = rend.getCellWidth() * 14; // "Paste Primary" length
@@ -956,7 +956,7 @@ fn handleMouseEvent(shell: *pty.Pty, scr: *screen.Screen, conn: *client.Connecti
         if (chord_condition and is_chord_press) {
             // Determine menu type based on which button was pressed
             const menu_type: ChordMenu.MenuType = if (mouse.button == .middle) .edit else .paste;
-            log.info("CHORD DETECTED: showing {s} menu at ({}, {})", .{ @tagName(menu_type), mouse.x, mouse.y });
+            log.debug("CHORD DETECTED: showing {s} menu at ({}, {})", .{ @tagName(menu_type), mouse.x, mouse.y });
             chord_menu.show(mouse.x, mouse.y, menu_type);
             chord_menu.updateSelectionScaled(mouse.x, mouse.y, rend.getCellWidth(), rend.getCellHeight(), rend.scale);
             mouse_state.chord_handled = true;
