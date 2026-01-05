@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const backend = @import("backend");
-const evdev = @import("evdev");
+const bsdinput = @import("bsdinput");
 
 const log = std.log.scoped(.drawfs_backend);
 
@@ -201,8 +201,8 @@ pub const DrawfsBackend = struct {
     // Read buffer for protocol
     read_buf: [4096]u8,
 
-    // Input handling via evdev module
-    input: ?*evdev.EvdevInput,
+    // Input handling via bsdinput module (libinput preferred)
+    input: ?*bsdinput.BsdInput,
 
     const Self = @This();
 
@@ -249,9 +249,9 @@ pub const DrawfsBackend = struct {
 
         log.info("connected to drawfs: display {}x{}", .{ self.display_width, self.display_height });
 
-        // Initialize input devices via evdev module
-        self.input = evdev.EvdevInput.init(allocator, self.display_width, self.display_height) catch |err| blk: {
-            log.warn("failed to initialize evdev input: {}", .{err});
+        // Initialize input devices via bsdinput module (libinput preferred)
+        self.input = bsdinput.BsdInput.init(allocator, self.display_width, self.display_height) catch |err| blk: {
+            log.warn("failed to initialize bsdinput: {}", .{err});
             break :blk null;
         };
 
