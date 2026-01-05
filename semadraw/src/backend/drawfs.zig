@@ -40,10 +40,34 @@ const EVT_SURFACE_PRESENTED: u16 = 0x9002;
 // Pixel formats
 const FMT_XRGB8888: u32 = 1;
 
-// ioctl for MAP_SURFACE
-// FreeBSD ioctl encoding: _IOWR('D', 0x02, struct) = 0xC0104402
-// Size = 16 bytes (4 fields * 4 bytes each)
-const DRAWFSGIOC_MAP_SURFACE: u32 = 0xC0104402;
+// ============================================================================
+// ioctl encoding helpers
+// ============================================================================
+//
+// BSD/Linux ioctl command encoding (from sys/ioccom.h):
+//   Bits 31-30: Direction (0=none, 1=write, 2=read, 3=read+write)
+//   Bits 29-16: Size of the data structure (14 bits, max 16383 bytes)
+//   Bits 15-8:  Type (magic character identifying the driver)
+//   Bits 7-0:   Command number
+//
+// _IOWR('D', 0x02, struct) means: read+write, type='D', cmd=0x02, size=sizeof(struct)
+
+const IOC_VOID: u32 = 0x20000000; // no parameters
+const IOC_OUT: u32 = 0x40000000; // copy out (read)
+const IOC_IN: u32 = 0x80000000; // copy in (write)
+const IOC_INOUT: u32 = IOC_IN | IOC_OUT; // read+write (0xC0000000)
+
+/// Computes ioctl command number at comptime, matching _IOC/_IOWR macros.
+/// This ensures the encoding stays correct if struct size changes.
+fn ioc(dir: u32, typ: u8, nr: u8, comptime T: type) u32 {
+    const size: u32 = @sizeOf(T);
+    return dir | (size << 16) | (@as(u32, typ) << 8) | nr;
+}
+
+/// _IOWR equivalent: read+write ioctl
+fn iowr(typ: u8, nr: u8, comptime T: type) u32 {
+    return ioc(IOC_INOUT, typ, nr, T);
+}
 
 const MapSurfaceReq = extern struct {
     status: i32,
@@ -51,6 +75,21 @@ const MapSurfaceReq = extern struct {
     stride_bytes: u32,
     bytes_total: u32,
 };
+
+// Computed at comptime: _IOWR('D', 0x02, struct drawfs_map_surface)
+// If MapSurfaceReq size changes, this will automatically update.
+const DRAWFSGIOC_MAP_SURFACE: u32 = iowr('D', 0x02, MapSurfaceReq);
+
+// Compile-time verification that our encoding matches the expected value
+comptime {
+    // Expected: 0xC0104402 = direction(0xC0) | size(0x10=16) | type('D'=0x44) | cmd(0x02)
+    if (DRAWFSGIOC_MAP_SURFACE != 0xC0104402) {
+        @compileError("DRAWFSGIOC_MAP_SURFACE encoding mismatch - struct size may have changed");
+    }
+    if (@sizeOf(MapSurfaceReq) != 16) {
+        @compileError("MapSurfaceReq size mismatch - expected 16 bytes");
+    }
+}
 
 // ============================================================================
 // Protocol helpers
