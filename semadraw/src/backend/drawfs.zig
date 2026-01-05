@@ -282,17 +282,21 @@ pub const DrawfsBackend = struct {
         defer self.allocator.free(frame);
 
         // Send
+        log.debug("sending frame: {} bytes, msg_type=0x{x:04}", .{ frame.len, msg_type });
         var sent: usize = 0;
         while (sent < frame.len) {
             sent += posix.write(self.fd, frame[sent..]) catch |err| {
                 return err;
             };
         }
+        log.debug("sent {} bytes, waiting for reply...", .{sent});
 
         // Read reply (may need to skip events)
         while (true) {
             const n = try readFrame(self.fd, &self.read_buf);
+            log.debug("received frame: {} bytes", .{n});
             const reply = parseReply(self.read_buf[0..n]);
+            log.debug("parsed reply: msg_type=0x{x:04}, payload_len={}", .{ reply.msg_type, reply.payload.len });
 
             // Skip events
             if (reply.msg_type == EVT_SURFACE_PRESENTED) {
