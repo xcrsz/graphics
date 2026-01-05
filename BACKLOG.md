@@ -6,20 +6,22 @@ This backlog tracks the work required to resolve protocol incompatibilities betw
 
 ## Priority 1: Critical (Blocking Issues)
 
-### 1.1 Remove Duplicate SURFACE_PRESENT Reply Struct
+### 1.1 Remove Duplicate SURFACE_PRESENT Reply Struct ✅ DONE
 **Files**: `drawfs/sys/dev/drawfs/drawfs_proto.h`
 **Effort**: Small
 **Risk**: Low
+**Commit**: `b7d5460`
 
 **Problem**: Two conflicting struct definitions exist for SURFACE_PRESENT reply:
 - `drawfs_surface_present_rep` (lines 176-181) - missing `cookie` field
 - `drawfs_rpl_surface_present` (lines 199-203) - correct with `cookie` field
 
 **Tasks**:
-- [ ] Remove `struct drawfs_surface_present_rep` (lines 176-181)
-- [ ] Grep codebase for any usage of the removed struct
-- [ ] Update any code using the old struct name to use `drawfs_rpl_surface_present`
-- [ ] Add comment explaining the `cookie` field semantics
+- [x] Remove `struct drawfs_surface_present_rep` (lines 176-181)
+- [x] Remove `struct drawfs_surface_present_req` (also duplicate, missing cookie)
+- [x] Grep codebase for any usage of the removed struct
+- [x] Update any code using the old struct name to use `drawfs_rpl_surface_present`
+- [x] Add comment explaining the `cookie` field semantics
 
 ---
 
